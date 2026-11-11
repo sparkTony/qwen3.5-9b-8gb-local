@@ -1,0 +1,53 @@
+version = 1
+
+; 由 scripts\render-ini.ps1 生成 models.ini，要改就改这个模板（每次启动都会重新渲染）。
+; 改完重新双击 start-llama.bat 生效。
+; 改了 ctx-size，必须同步改 cordis.patch.yml 里对应模型的 contextWindow，
+; 否则 dsh 的压缩阈值永远够不到，最后直接撞服务端的 exceed_context_size_error
+; —— apply-dsh-config.ps1 会帮你检查这一项。
+; 档位与显存对照表见 README 的"显存档位表"。
+
+[*]
+; 下面三行是地基，别动：
+;   jinja 关了读不到模型自带的对话模板，工具调用立刻坏；
+;   flash-attn 关了更占显存、长文本更慢；
+;   n-gpu-layers 调小会把权重丢到内存，速度掉一个数量级。
+jinja = true
+flash-attn = on
+n-gpu-layers = 99
+; KV 缓存量化，可以动。想开更大窗口就换 q4_0（KV 减半，精度略降）；
+; f16 无损但显存翻倍。通常先降 ctx-size 比降这里更划算。
+cache-type-k = q8_0
+cache-type-v = q8_0
+
+; 文字模型，dsh 的大脑。
+[qwen3.5-9b]
+model = {{ROOT}}/models/Qwen3.5-9B-Q4_K_M.gguf
+; 可调。8GB 卡默认 65536：实测常驻 6508 MiB、余 1391 MiB，灌 61267 token 通过。
+; 更大：81920 约 6856、98304 约 7208（余 691）、114688 只剩 339；131072 装不下。
+; 显存更小或还要同时开别的大程序：降到 49152（6152 MiB）或 32768（5800 MiB）。
+ctx-size = 65536
+; 必须保持 1，别删。删掉就变成默认 4 个槽位，窗口被切成 4 份，每个请求都超窗报错。
+parallel = 1
+; 采样，可以随便调。0.6 是 agent 任务的折中；要更稳的工具调用参数就降到 0.2。
+temp = 0.6
+top-k = 20
+top-p = 0.95
+min-p = 0.0
+
+; 视觉模型，modlens 识图用。
+[qwen3-vl-4b]
+model = {{ROOT}}/models/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+; 文件名必须以 mmproj 开头，且必须放在子目录里。改名的后果是识图能力静默消失，不报错。
+mmproj = {{ROOT}}/models/Qwen3-VL-4B-Instruct/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
+; 可调。32768 空闲常驻 5954 MiB，编码 4K 时峰值 7160 MiB；40960 就只剩 289 MiB 了。
+ctx-size = 32768
+; 可调，而且决定截图清晰度的其实是这一行，不是 ctx-size。
+; 图像 token = 宽×高÷1024（32×32 像素一个 token），超过这个顶的图会被缩小后再喂、
+; 不报错，所以窗口不会因为图太大而爆——代价是小字糊。
+;   4096 = 引擎默认：细节上限约 4.2 MP，4K 一张约 4.6 秒，编码瞬时多占 476 MiB
+;   8192 = 当前值：  约 8.4 MP 内全保，4K 一张约 13.0 秒，编码瞬时多占 1206 MiB
+; 一条消息能塞几张：按张数线性叠加，8192 时 4K 最多 3 张（24496 / 32768）。
+image-max-tokens = 8192
+; 建议保持低位：它输出的是 modlens 要解析的 JSON，温度高了容易出非法格式。
+temp = 0.2

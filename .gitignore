@@ -1,0 +1,21 @@
+# 大文件与二进制：引擎和权重永远不进仓库
+engine/
+models/
+*.gguf
+*.zip
+*.7z
+
+# 由模板/示例生成的本机实配置，含绝对路径与本地密钥
+models.ini
+config.bat
+
+# 运行期产物
+*.log
+logs/
+tmp/
+*.bak
+*.bak.*
+
+node_modules/
+.DS_Store
+Thumbs.db

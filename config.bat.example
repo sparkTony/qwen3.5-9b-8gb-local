@@ -1,0 +1,5 @@
+@echo off
+REM  config.bat.example -- copy to config.bat, then fill in your own values.
+REM  Lines must stay as  set NAME=value  (no spaces around =).
+set PORT=2210
+set API_KEY=replace-me-with-your-own-random-hex
