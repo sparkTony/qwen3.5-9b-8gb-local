@@ -1,0 +1,364 @@
+================================================================
+  Qwen3.5-9B 本地推理服务 使用说明
+  目录: <LLAMA_HOME>
+  更新于: 2026-11-07 (改为路由模式, 增加本地视觉引擎)
+================================================================
+
+一、这套东西是什么
+------------------
+  llama.cpp b12110 (CUDA 13.4) 路由模式(router), 一个端口两个模型:
+    qwen3.5-9b    文字  Qwen3.5-9B Q4_K_M (5.68GB)  -> 给 dsh 当大脑
+    qwen3-vl-4b   视觉  Qwen3-VL-4B Q4_K_M + mmproj (2.9GB) -> 给 modlens 识图
+  API 地址:  http://127.0.0.1:<端口>/v1
+  实测(2026-11-07 晚, 8GB 卡可用 7899 MiB):
+    qwen3.5-9b   @ ctx 65536 + q8_0  -> 常驻 6508 MiB, 余量 1391 MiB  (当前默认)
+    qwen3.5-9b   @ ctx 98304 + q8_0  -> 常驻 7208 MiB, 余量  691 MiB  (可选上限档)
+    qwen3.5-9b   @ ctx 49152 + q8_0  -> 驻留 6152 MiB (早期配置, 留作对照)
+    qwen3-vl-4b  @ ctx 32768 + q8_0  -> 空闲驻留 5954 MiB; 编码 4K 截图时峰值 7160 MiB(余 739)
+    qwen3-vl-4b  @ ctx 16384 + q8_0  -> 驻留 5060 MiB (旧配置, 留作对照)
+    窗口显存估算: 文字模型 约5096固定 + ctx x 22 KiB/token;  视觉模型 约4167固定 + ctx x 55.9 KiB/token
+                  (视觉 36 层全存 KV, 每 token 贵 2.5 倍; 上面两个系数都由实测两点定出)
+    65536 -> 6508(推算 6504, 差 4 MiB); 98304 -> 7208(吻合); 131072 -> 约 7912, 装不下。
+    图像 token = 宽x高/1024 (32x32 像素一个 token), 到 image-max-tokens 顶为止:
+      默认顶约 4096 -> 超过 4.2 MP 的图被缩小(不报错), 4K 只当 4.2 MP 用
+      设 8192      -> 上限约 8.4 MP, 4K 原分辨率进模型, 但一张 4K 要 13 秒
+    单图耗时(顶 8192): 1080p 0.5 秒 / 2K 3.6 秒 / 4K 13.0 秒; 每张独立封顶、线性叠加
+      6 张 1080p = 12262 token; 4K 最多 3 张(24496 token), 第 4 张会超 32768
+    窗口 65536 灌 61267 token 通过(93.5%); 46188 token 冷启动 31.1 秒(1485 t/s)
+    窗口 98304 灌 94867 token 通过(96.5%); 105488 token 被服务端干净拒绝
+    显存与"用了多少上下文"无关(70K/90K/94.8K 峰值都是 7212 MiB), 窗口是一次性预分配
+    冷启动 90145 token 请求 66.1 秒(约 1363 t/s), 埋在 5%/50%/95% 深度的三个针全找回
+    46030 token 的超长请求实测通过(预填充 26.2 秒, 约 1750 t/s)
+  同一时刻只有一个模型进显存(--models-max 1), 换模型时有一次加载
+  等待(冷启动 8~10 秒, 页缓存热了约 4~5 秒, 见第五节)。
+
+二、日常启动 / 停止
+------------------
+  启动: 双击  start-llama.bat
+        窗口会一直停留显示日志, 看到
+        "listening on http://127.0.0.1:<端口>" 即启动成功。
+        首次加载模型约需 10~30 秒。
+
+  停止: 直接关掉黑色窗口, 或窗口内按 Ctrl+C。
+
+  验证是否活着(浏览器或命令行都行):
+        http://127.0.0.1:2210/health   ->  {"status":"ok"}
+
+三、自定义端口和 API key
+------------------------
+  编辑  config.bat  (记事本打开即可), 这里只有两项:
+
+        set PORT=2210          <- 改成你想要的端口
+        set API_KEY=xxxx       <- 改成你的密钥; 留空=不鉴权
+
+  当前 API key 不在本文档里(这份文件会入库)。看  config.bat 的 API_KEY= 那一行,
+  它已经在 .gitignore 里; dsh 和 modlens 里填的必须和它完全一致, 否则 401。
+
+  模型参数(上下文/KV量化/采样)挪到了  models.ini, 每个模型一段:
+
+        [qwen3.5-9b]   ctx-size = 65536  cache-type-k/v = q8_0
+        [qwen3-vl-4b]  ctx-size = 32768  image-max-tokens = 8192  多了 mmproj 一行
+
+  改完重启 start-llama.bat 生效。显存不够就先降 ctx-size(每 49152 token 约 1056 MiB)。
+
+四、接入 DeepSeek Harness (dsh)
+-------------------------------
+  配置文件: ~\.dsh\profiles\desktop\cordis.patch.yml
+  已写好一个 provider (名字 localqwen), 且已设为默认模型。
+
+  你只需在 dsh 桌面端:
+    1) 设置 -> 模型 -> "Qwen3.5-9B local (llama.cpp)"
+    2) API key 填上面那串密钥 (必须和服务端一致, 否则 401)
+    3) 发一个任务试跑
+
+  注意:
+    - 用 dsh 之前要先双击 start-llama.bat 把服务跑起来;
+    - 改过 config.bat 的端口后, dsh 里的 baseURL 也要同步改
+      (http://127.0.0.1:<新端口>/v1);
+    - 给 9B 小模型别挂太多工具: 5 个以内, 可靠性最好;
+    - 服务端上下文由 models.ini 的 ctx-size 决定(现 65536);
+    - dsh 只从 /v1/models 读容量, 而 llama.cpp 不返回这个字段, 所以必须在
+      cordis.patch.yml 的模型条目里手写 contextWindow, 否则 dsh 按 100 万
+      token 算, 压缩永远不会触发, 直接撞服务端的 exceed_context_size_error。
+
+五、接入 modlens 视觉引擎(识图)
+------------------------------
+  modlens 是 dsh 插件(@liustack/modlens, 已装进 desktop profile),
+  它自己不带视觉能力, 必须给它指一个"能看图的 OpenAI 兼容端点"。
+  本机这条全本地: 让它点 models.ini 里的 qwen3-vl-4b。
+
+  已写入 ~\.modlens\config.json:
+        provider        = openai
+        openai.baseUrl  = http://127.0.0.1:2210/v1
+        openai.apiKey   = (同服务端密钥)
+        openai.model    = qwen3-vl-4b
+        (openai.proxy 字段已删除 = 跟随系统代理)
+
+  代理说明: modlens 的 providers.openai.proxy 是三态字段。
+        字段缺失   = 继承顶层 proxy, 再退到 HTTPS_PROXY/HTTP_PROXY, 这条遵守 NO_PROXY
+        空字符串   = 强制直连
+        填 URL     = 只给这个 provider 用
+  本机现状: 用户级/机器级 HTTPS_PROXY 都为空, IE 代理 ProxyEnable=0,
+        环境里 NO_PROXY 已含 127.0.0.1, 所以继承模式下本地端点仍是直连。
+  例外: 若改用顶层键 modlens config set proxy <url>, 那条不保证遵守
+        NO_PROXY, 本地端点可能被打进代理; 那时再单独设
+        modlens config set openai.proxy "" 强制直连。
+
+  改端口/密钥后同步这几项:
+        cd "~\.dsh\profiles\desktop"
+        node_modules\.bin\modlens.CMD config set openai.baseUrl http://127.0.0.1:<端口>/v1
+        node_modules\.bin\modlens.CMD config show      <- 看当前生效配置
+        node_modules\.bin\modlens.CMD doctor           <- 离线自检, 不花额度
+
+  手动测一张图(不用开 dsh, 注意 -i 不能省):
+        node_modules\.bin\modlens.CMD analyze -i "<某张截图.png>" -o "%TEMP%\out.json"
+
+  必须选对模型, 否则粘图会被 dsh 直接拦掉:
+    提示 "当前模型不支持图片, 请切换支持图片的模型"
+    = 你选的是 qwen3.5-9b(纯文本本体)。modlens 会给文本模型注册一个
+      视觉分身, 分组 id 形如 modlens-localqwen, 名字带 "(modlens vision)"。
+    分身默认没有: modlens 只给 families 名单里的前缀建分身(默认只有
+      deepseek/glm/mimo)。已在 cordis.patch.yml 里加:
+        - id: modlens
+          name: "@liustack/modlens"
+          config:
+            families: ['deepseek', 'glm', 'mimo', 'ling', 'qwen']
+    改完要重启 dsh 桌面端, 然后在模型下拉里选 "(modlens vision)" 那条。
+    注意 families 是替换默认值, 不是追加; 别用 ['*'], 那要求上游显式
+    声明 inputModalities 包含 text, 我们本地这条没声明。
+
+  重要: 因为只有 8GB 显存, 文字模型和视觉模型不会同时在显存里。
+  实测切换成本:
+    视觉 -> 文字: 一次请求总耗时 9.8 秒(其中卸载+加载约 7 秒)
+    文字 -> 视觉: 一次识图总耗时 8.6 秒
+    模型已在显存时, 单张图识别只要 4.6 秒
+    图像本身的耗时按分辨率走(image-max-tokens=8192, 提示词很短、只测进模型这一段):
+      1920x1080 约 0.5 秒 / 2560x1440 约 3.6 秒 / 3840x2160 约 13.0 秒
+    modlens 还要输出结构化 JSON, 实际比这几个数久; 粘 4K 前先想想要不要全分辨率
+  也就是说每粘一次图, 下一条文字消息要多等约 8~10 秒。
+  偶尔截图很划算, 别一条消息塞十张图, 也别指望图多时还顺滑。
+
+六、显存档位怎么挑（两个模型的 ctx-size 各调各的）
+
+  先记住一条实测结论，它会改变你的选档思路：
+    **显存只跟"窗口开多大"有关，跟"实际用了多少"无关。**
+    灌 70K / 90K / 94.8K token 三档，峰值都是 7212 MiB —— 窗口是启动时一次性预分配的。
+    所以不存在"先开大点、用不到会自动还回去"；选档位就是选常驻显存。
+
+  两个模型从不同时在显存里(--models-max 1)，所以你的真实占用 =
+      max(文字常驻, 视觉常驻 + 识图瞬时开销)
+
+  6.1 文字模型 qwen3.5-9b —— 斜率 22 KiB/token，固定部分 5096 MiB
+
+  ctx-size | 常驻显存 | 剩余(可用7899) | 大约够干什么                  | 依据
+  -------- + --------- + -------------- + ----------------------------- + ----------
+      8192 | 5272 MiB  |   2627 MiB     | 短对话、改单个小文件          | 向下外推
+     16384 | 5448 MiB  |   2451 MiB     | 单文件级改动                  | 向下外推
+     24576 | 5624 MiB  |   2275 MiB     | 一次读 3~4 个中等文件          | 向下外推
+     32768 | 5800 MiB  |   2099 MiB     | 小项目整体问答                | 向下外推
+     49152 | 6152 MiB  |   1747 MiB     | 14 个文件整包分析(21K)绰绰有余 | **实测**
+     65536 | 6508 MiB  |   1391 MiB     | 本包默认；灌 61267 token 通过   | **实测**
+     81920 | 6856 MiB  |   1043 MiB     | --                            | 内插
+     98304 | 7208 MiB  |    691 MiB     | 可选上限；灌 94867 token 通过   | **实测**
+    114688 | 7560 MiB  |    339 MiB     | 太紧，不建议                  | 向上外推
+    131072 | 7912 MiB  |    -13 MiB     | **装不下**                    | 向上外推
+
+  为什么这个模型敢开这么大：Qwen3.5 是混合线性注意力，32 层里只有 8 层存 KV
+  (full_attention_interval=4)，其余 24 层的状态与长度无关。
+
+  6.2 视觉模型 qwen3-vl-4b —— 斜率 55.9 KiB/token，固定部分 4167 MiB
+
+  注意：它 36 层**全存 KV**，每 token 比文字模型贵 2.5 倍，别照抄上面的档位。
+
+  ctx-size | 常驻显存 | 剩余 | 加上识图瞬时(imt=8192 约 +1206)后 | 依据
+  -------- + --------- + ----- + -------------------------------- + ----------
+      8192 | 4614 MiB  | 3285  | 5820 MiB，余 2079                | 向下外推
+     12288 | 4838 MiB  | 3061  | 6044 MiB，余 1855                | 向下外推
+     16384 | 5060 MiB  | 2839  | 6266 MiB，余 1633                | **实测**
+     24576 | 5507 MiB  | 2392  | 6713 MiB，余 1186                | 内插
+     32768 | 5954 MiB  | 1945  | **7160 MiB，余 739**             | **实测**(编码峰值)
+     40960 | 6404 MiB  | 1495  | 7610 MiB，余 289 太紧            | 向上外推
+     49152 | 6851 MiB  | 1048  | 8057 MiB **装不下**              | 向上外推
+     65536 | 7744 MiB  |  155  | **装不下**                       | 向上外推
+
+  识图瞬时开销也是实测的：imt=4096 时 +476 MiB，imt=8192 时 +1206 MiB
+  （约每 1K 图像 token 多占 150 MiB）。这一栏才是视觉路线真正该看的数。
+
+  6.3 image-max-tokens —— 决定截图清晰度的是它，不是 ctx-size
+
+  图像 token 数 = 宽 x 高 / 1024（Qwen3-VL 是 32x32 像素一个 token）。
+  超过这个顶的图**会被缩小后再喂，不报错**，所以窗口永远不会因为图太大而爆——
+  代价是小字糊掉。
+
+  顶值          细节上限   单图最多token | 4K 单图耗时 | 备注
+  ------------- + --------- + ------------ + ----------- + ------------------
+  4096(引擎默认)  约 4.2 MP  | 4082         | 约 4.6 秒   | 4K/5K 都被缩，小字糊
+  8192(本包默认)  约 8.4 MP  | 8151         | 约 13.0 秒  | 4K 原分辨率进模型
+  16384           约 16.8 MP | --           | 未实测      | 需要 ctx>=18000，8GB 卡装不下
+
+  配套约束（不满足就会真的超窗）：
+      ctx-size >= image-max-tokens + 提示词 + 输出 + 其它图
+  一条消息能粘几张：每张独立按顶计算、线性叠加。实测 6 张 1080p = 12262 token 正常；
+  imt=8192 时 4K 最多 **3 张**(24496 / 32768 = 75%)，第 4 张超窗。
+
+  6.4 现成的组合（都是 8GB 卡，imt = image-max-tokens）
+
+  "最紧占用"取的是 max(文字常驻, 视觉常驻 + 识图瞬时)，不是文字那一栏——
+  所以下表最后两列请看"最紧占用/余量"，别只看文字 ctx。
+
+  组合     | 文字 ctx | 视觉 ctx | imt  | 最紧占用 | 余量  | 适合谁
+  --------- + -------- + -------- + ---- + -------- + ----- + -------------------------
+  保守     |  49152   |  16384   | 4096 | 6152 MiB | 1747  | 还要同时开浏览器/游戏/别的大程序
+  本包默认 |  65536   |  32768   | 8192 | 7160 MiB |  739  | 4K 也看清，接受一次约 13 秒
+  顺滑优先 |  65536   |  32768   | 4096 | 6508 MiB | 1391  | 截图多是 1080p/2K，宁可 4K 糊一点也要余量
+  窗口极限 |  98304   |  32768   | 8192 | 7208 MiB |  691  | 超长上下文优先，且愿意接受 4K 慢
+  不建议   | 114688   |  32768   | 4096 | 7560 MiB |  339  | 一次显存抖动就失败，别用
+
+  有个反直觉的点值得记住：文字窗口从 98304 降到 65536 省下的 700 MiB，
+  在 imt=8192 时**并没有变成余量**，因为瓶颈换成了视觉编码峰值(7160)。
+  真想要那 1391 MiB 余量，得同时把 imt 降回 4096。
+
+  6.5 每个参数能不能动
+
+  可以放心调：
+    ctx-size(两个段各一个)  按 6.1 / 6.2 的表选，改完必须同步 6.6 的两处
+    image-max-tokens        按 6.3 选；想清晰就升，想快就降回 4096
+    temp / top-k / top-p / min-p   采样偏好。文字段 0.6 是给 agent 的折中；
+                            视觉段 0.2 是要它稳定输出 JSON，别调高
+    cache-type-k / cache-type-v    换 q4_0 可让 KV 部分再省一半、从而开更大窗口；
+                            但先看 6.1 的余量够不够，降 ctx 通常比降 KV 精度更划算
+    flash-attn              保持 on。关掉会更占显存
+
+  不要动（动了就坏，且报错信息不会告诉你原因）：
+    parallel = 1            路由模式下必须 1。删掉默认 4 个 slot，窗口被切成 4 份，
+                            直接 exceed_context_size_error
+    jinja = true            关了就吃不到 GGUF 内嵌的 chat template，tool_call 立刻坏
+    n-gpu-layers = 99       意思是"全部层进显存"。调小会把层丢到内存，
+                            9B 大约 5 GB 权重，速度会掉一个数量级
+    section 名 [qwen3.5-9b] / [qwen3-vl-4b]
+                            名字**就是**模型 id。改了它，dsh 的 provider 模型卡片和
+                            ~/.modlens/config.json 里的 openai.model 都要同步改
+    mmproj 那一行           文件名必须以 mmproj 开头，且必须放在子目录里；
+                            改名的后果是"识图功能直接消失"，而不是报错
+    模型文件与量化(Q4_K_M)  别换成更低比特的"小巧版"。三值/1.58bit 那类超压缩会让
+                            模型编造函数名和参数，表现为 agent 反复用错参数卡死
+
+  6.6 改完 ctx-size 必须同步的两个地方（否则压缩不生效）
+
+    1) ~\.dsh\profiles\desktop\cordis.patch.yml
+       在 localqwen 的 models 里，两个模型各自的 contextWindow 要等于 ctx-size；
+       maxTokens 是单次输出上限。漏了这一项，dsh 会按 100 万 token 估算，
+       压缩阈值永远够不到，最后直接撞服务端的 exceed_context_size_error。
+    2) 完全退出 dsh 再重开（配置只在启动时读）。
+       验证：新会话里看上下文百分比是否跟着真实长度动。
+    整合包用户不用手改：重跑 scripts\apply-dsh-config.ps1，它会检查并告诉你缺哪一行。
+
+七、和其它引擎的互斥关系(重要)
+------------------------------
+  这张 8GB 显卡同一时间只能跑一个引擎:
+    - ninfer/Bonsai2-27B 在 <其它模型目录>\
+      (端口 1234, 仅供普通聊天, 不建议给 agent 用);
+    - 它运行时 start-llama.bat 会拒绝启动, 反之 2210 被占
+      llama-server 也会报错退出。
+  先停一个再开另一个。
+
+八、常见问题
+------------
+  Q1 双击后窗口一闪而过
+     看窗口文字来不及的话, 从开始菜单开一个 cmd, 执行:
+         "<LLAMA_HOME>\start-llama.bat"
+     常见原因:
+       - 端口被上一个没关干净的实例占用 -> 任务管理器结束
+         llama-server.exe 再试;
+       - ninfer 服务还在跑 -> 先关它。
+
+  Q2 客户端报 401 / Invalid API Key
+     dsh(或任何客户端)里填的 key 和 config.bat 不一致。
+
+  Q3 报 port in use / bind failed
+     2210 被占。netstat -ano | findstr :2210 查 PID,
+     任务管理器结束对应进程。
+
+  Q4 速度明显变慢或整机卡死
+     检查是不是 ninfer 和 llama 同时在跑, 或显存被别的
+     程序(浏览器硬件加速/游戏)吃掉。
+
+  Q5 想恢复默认端口/密钥
+     config.bat 里改回 PORT=2210 和原密钥即可。
+
+  Q6 dsh 报 "exceeds the available context size"
+     说明请求超过 models.ini 里 [qwen3.5-9b] 的 ctx-size。
+     加到 65536 试试; 若显存不够(49K+q8_0 已经接近上限),
+     把 cache-type-k/v 改成 q4_0 再加大。
+     另注意 dsh 会话太长时应新开对话, 上下文会越滚越大。
+
+  Q7 dsh 反复写不进文件 / 工具全失败(不是模型的锅)
+     11月7日那次会话的实况: 模型把 cwd 用
+     working_directory 切进了
+       <dsh 安装目录>\resources\app.asar\dsh\...
+     这是 Electron 打包归档(一个 213MB 的文件, 不是目录),
+     只读。切进去之后所有工具一起坏, 而且报错很骗人:
+       write      -> ENOTDIR, not a directory
+       read       -> not a regular file
+       glob/grep  -> ripgrep provider failure
+       pwsh/bash  -> spawn powershell.exe ENOENT (它其实在)
+     于是模型以为"再试一次就好", 结果连环重试卡死。
+     处理: 让 dsh 立刻 cd 回项目目录(如 <项目目录>),
+     或直接新开一个会话(旧会话的坏 cwd 会一直留着)。
+     已写 ~\.dsh\AGENTS.md 做全局约束:
+     禁止 cd 进安装目录, asar 内只准 read 不准写。
+     另: 日志里 5 次 Connection error/TRANSPORT 是当时
+     2210 服务没启动, 先双击 start-llama.bat 再说。
+
+  Q8 粘图没反应 / modlens 报错
+     先离线自检(不花额度):
+       cd "~\.dsh\profiles\desktop"
+       node_modules\.bin\modlens.CMD doctor
+     [ok] openai 那行必须出现; 服务没起来时会连接失败,
+     不是配置错。重启 dsh 桌面端才会加载插件。
+
+  Q9 每次识图后下一条文字请求特别慢
+     正常: 8GB 显存只放得下一个模型, 路由在来回换。
+     想避免就回退成单模型模式(models.ini 只留 [qwen3.5-9b]),
+     代价是没视觉; 想要都快就得换 16GB 以上的卡。
+
+  Q10 4K 截图里的小字看不清
+     不是 ctx-size 的问题，是 image-max-tokens 到顶后图被**缩小**再喂（不报错）。
+     引擎自带默认约 4096 token，只保住约 4.2 MP；本包已设 8192 → 约 8.4 MP，
+     4K 按原分辨率进模型，代价是一张 4K 从约 4.6 秒变成约 13.0 秒。
+     见第六节 6.3。
+
+  Q11 想开更大的窗口，或者启动时显存不够
+     按 6.1 / 6.2 的表选档，别猜：窗口是启动时一次性预分配的，
+     开多大就占多少，跟实际用掉多少 token 无关。
+     文字模型上限 98304（7208 MiB，余 691）；131072 算出来 7912 MiB，装不下。
+     视觉模型上限 32768（空闲 5954 + 编码瞬时约 1206 = 7160 MiB）；40960 就只剩 289 了。
+     显存实在不够：先把 image-max-tokens 降回 4096（省 730 MiB 瞬时），
+     再考虑把 cache-type-k/v 换成 q4_0 或降 ctx-size。
+
+九、目录结构
+------------
+  <LLAMA_HOME>\
+    ├── start-llama.bat     启动脚本(双击这个, 路由模式)
+    ├── config.bat          端口 / API key
+    ├── models.ini          每个模型的参数(ctx/KV/采样/mmproj)
+    ├── engine\             llama.cpp 程序 + CUDA 运行库 + mtmd.dll
+    ├── models\
+    │     ├── Qwen3.5-9B-Q4_K_M.gguf              文字 5.68GB
+    │     └── Qwen3-VL-4B-Instruct\               视觉 2.5GB
+    │           ├── Qwen3VL-4B-Instruct-Q4_K_M.gguf
+    │           └── mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
+    └── tmp\                测试用文件, 可留可删
+
+  模型 id 由 models.ini 的 section 名决定(qwen3.5-9b / qwen3-vl-4b),
+  视觉模型的 mmproj 必须和主模型同目录、文件名以 mmproj 开头。
+
+  技术备忘:
+    - CUDA dll (cublas64_13 等) 复用自 ninfer 目录, 别删;
+    - start-llama.bat 必须保持 CRLF 行尾 + 纯 ASCII,
+      否则 cmd 会闪退;
+    - 想同时驻留两个模型: --models-max 2 在 8GB 上装不下, 别试;
+    - 引擎升级: 从 llama.cpp GitHub Releases 下载
+      win-cuda-13.4-x64 zip, 覆盖 engine\ 即可(国内需走
+      gh-proxy 镜像 + 分段下载)。
+================================================================
