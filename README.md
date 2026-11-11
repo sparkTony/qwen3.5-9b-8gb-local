@@ -479,9 +479,10 @@ modlens 的解法是给文本模型注册一个**视觉分身**（provider id �
 - 夸克网盘：<https://pan.quark.cn/s/d4f513ccc101?pwd=LsDS>　提取码：`LsDS`
 - 压缩包 sha256：`28aac9ac86490b1780a6d8ebcfc7af5da49a809690b8c5b5816b96d21c1041f6`
 - 大小：**9,041,656,237 字节**（8.42 GiB / 9.04 GB）
-- 上面的 sha256 与字节数是**对本地这份 zip 实测**得到的（`certutil -hashfile dsh-local-pack.zip SHA256`，10.8 秒）。
-  下载后先比字节数再看 sha256：网盘客户端显示的大小若不是 9,041,656,237，说明传上去的不是这一份，
-  别拿这里的哈希去判对错。
+- sha256 是对本地这份 zip 实测得到的（`certutil -hashfile dsh-local-pack.zip SHA256`，10.8 秒算完）；
+  网盘上那份显示的大小已核对为 **9,041,656,237 字节**，与本地一致，所以上面这个哈希就是你要比对的值。
+- 下载完先比大小再看 sha256。网盘大文件下载不完整是这类包最常见的故障，
+  一个半截的 GGUF 会带来千奇百怪的报错，比重新下一遍贵得多。
 - 链接失效或模型升级会在本 README 顶部更新，issue 里喊一声更快
 
 包内自带 `README.md`（四步上手）、`scripts\apply-dsh-config.ps1`（幂等写 dsh/modlens
